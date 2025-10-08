@@ -1,0 +1,89 @@
+version: "3.9"
+
+volumes:
+  acme:
+
+
+networks:
+  internet:
+    internal: false
+  proxy_attestd:
+    internal: true
+  proxy_echo:
+    internal: true
+
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      # Entrypoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+
+      # Providers
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+
+      # Redirect HTTP to HTTPS
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+
+      # Enable ACME (Let's Encrypt)
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+
+      # Other settings
+      - --api=false
+      - --accesslog=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme:/acme
+    networks:
+      - outside_world
+      - proxy_attestd
+      - proxy_echo
+
+  attestd:
+    build: ./attestd
+    container_name: attestd
+    restart: unless-stopped
+    
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.attestd.rule=Host(`${SERVER_DOMAIN}`) && PathPrefix(`/attestd/`)
+      - traefik.http.routers.attestd.priority=9999
+      - traefik.http.routers.attestd.entrypoints=websecure
+      - traefik.http.routers.attestd.tls.certresolver=le
+      - traefik.http.services.attestd.loadbalancer.server.port=80
+      - traefik.http.middlewares.attestd-strip.stripprefix.prefixes=/attestd
+      - traefik.http.routers.attestd.middlewares=attestd-strip
+      - traefik.docker.network=proxy_attestd
+
+    volumes:
+      - acme:/acme:ro
+      - /dev/tdx-guest:/dev/tdx-guest
+    
+    networks:
+      - proxy_attestd
+
+  echo:
+    build: ./echo
+    container_name: echo
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.echo.rule=Host(`${SERVER_DOMAIN}`)
+      - traefik.http.routers.echo.entrypoints=websecure
+      - traefik.http.routers.echo.tls.certresolver=le
+      - traefik.http.services.echo.loadbalancer.server.port=80
+      - traefik.http.middlewares.echo-strip.stripprefix.prefixes=/echo
+    
+    networks:
+      - proxy_echo
