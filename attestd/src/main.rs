@@ -42,7 +42,7 @@ async fn attest(req: web::Json<AttestationRequest>) -> ActixResult<HttpResponse>
 
     // Extract the certificate from the ACME data
     // Traefik ACME JSON structure: Certificates array with domain and certificate
-    let certificates = acme_json["Certificates"]
+    let certificates = acme_json["le"]["Certificates"]
         .as_array()
         .ok_or_else(|| {
             actix_web::error::ErrorInternalServerError("Certificates not found in ACME data")

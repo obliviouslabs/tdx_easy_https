@@ -57,6 +57,7 @@ services:
     
     labels:
       - traefik.enable=true
+      - traefik.docker.network=proxy_attestd
       - traefik.http.routers.attestd.rule=Host(`${SERVER_DOMAIN}`) && PathPrefix(`/attestd/`)
       - traefik.http.routers.attestd.priority=9999
       - traefik.http.routers.attestd.entrypoints=websecure
@@ -64,7 +65,6 @@ services:
       - traefik.http.services.attestd.loadbalancer.server.port=80
       - traefik.http.middlewares.attestd-strip.stripprefix.prefixes=/attestd
       - traefik.http.routers.attestd.middlewares=attestd-strip
-      - traefik.docker.network=proxy_attestd
 
     volumes:
       - acme:/acme:ro
@@ -79,11 +79,11 @@ services:
     restart: unless-stopped
     labels:
       - traefik.enable=true
+      - traefik.docker.network=proxy_echo
       - traefik.http.routers.echo.rule=Host(`${SERVER_DOMAIN}`)
       - traefik.http.routers.echo.entrypoints=websecure
       - traefik.http.routers.echo.tls.certresolver=le
       - traefik.http.services.echo.loadbalancer.server.port=80
-      - traefik.http.middlewares.echo-strip.stripprefix.prefixes=/echo
     
     networks:
       - proxy_echo
