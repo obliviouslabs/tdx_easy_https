@@ -111,58 +111,6 @@ async fn attest(req: web::Json<AttestationRequest>) -> ActixResult<HttpResponse>
     Ok(HttpResponse::Ok().json(response))
 }
 
-pub fn verify_attestation(domain: &str, challenge_hex: &str, certificate: &str, report_b64: &str) -> Result<bool, String> {
-    // Decode the challenge from hex string to bytes
-    let challenge_bytes = hex::decode(challenge_hex)
-        .map_err(|e| format!("Failed to decode challenge: {}", e))?;
-
-    // Ensure challenge is 32 bytes (256 bits)
-    if challenge_bytes.len() != 32 {
-        return Err("Challenge must be 32 bytes".to_string());
-    }
-
-    // Calculate SHA256 hash of the certificate
-    let mut hasher = Sha256::new();
-    hasher.update(certificate);
-    let certificate_hash = hasher.finalize().to_vec();
-
-    // Create attestation data structure
-    let attestation_data = AttestationData {
-        domain: domain.to_string(),
-        certificate_hash,
-        challenge: challenge_bytes,
-    };
-
-    // Serialize to JSON bytes and hash with SHA512 to get expected report data
-    let attestation_bytes = serde_json::to_vec(&attestation_data)
-        .map_err(|e| format!("Failed to serialize attestation data: {}", e))?;
-
-    let mut report_hasher = Sha512::new();
-    report_hasher.update(&attestation_bytes);
-    let expected_report_data = report_hasher.finalize();
-
-    // Decode the report from base64
-    let report_bytes = general_purpose::STANDARD.decode(report_b64)
-        .map_err(|e| format!("Failed to decode report: {}", e))?;
-
-    // Verify the TDX quote
-    let quote = tdx_quote::Quote::from_bytes(&report_bytes)
-        .map_err(|e| format!("Failed to parse TDX quote: {:?}", e))?;
-
-    // Verify the quote (this checks the signature and validity)
-    quote.verify()
-        .map_err(|e| format!("TDX quote verification failed: {:?}", e))?;
-
-    // Check that the report data matches what we expect
-    let quote_report_data = quote.report_input_data();
-
-    if quote_report_data != expected_report_data.as_slice() {
-        return Err("Report data does not match expected attestation data".to_string());
-    }
-
-    Ok(true)
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Starting attestd server on port 80");
