@@ -1,0 +1,48 @@
+# Rust build output
+target/
+
+# Node/client dependencies and generated bundles
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment and secret material
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Generated certificates, ACME state, and runtime data
+certs/
+acme/
+data/
+tmp/
+*.crt
+*.csr
+*.key
+*.pem
+*.p12
+*.srl
+*.sqlite
+*.sqlite3
+*.db
+
+# Local Docker Compose overrides
+docker-compose.override.yml
+docker_compose.override.yml
+
+# Logs and transient command output
+*.log
+*.out
+*.pid
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

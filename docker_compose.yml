@@ -1,7 +1,5 @@
-version: "3.9"
-
 volumes:
-  acme:
+  certs:
 
 
 networks:
@@ -13,10 +11,28 @@ networks:
     internal: true
 
 services:
+  certs-init:
+    image: busybox:1.36
+    network_mode: none
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /certs
+        if [ ! -e /certs/traefik-certs.yml ]; then
+          printf 'tls:\n  certificates: []\n' > /certs/traefik-certs.yml
+        fi
+    volumes:
+      - certs:/certs
+    restart: "no"
+
   traefik:
     image: traefik:v3.1
     container_name: traefik
     restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     command:
       # Entrypoints
       - --entrypoints.web.address=:80
@@ -25,16 +41,12 @@ services:
       # Providers
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
+      - --providers.file.filename=/certs/traefik-certs.yml
+      - --providers.file.watch=true
 
       # Redirect HTTP to HTTPS
       - --entrypoints.web.http.redirections.entryPoint.to=websecure
       - --entrypoints.web.http.redirections.entryPoint.scheme=https
-
-      # Enable ACME (Let's Encrypt)
-      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/acme/acme.json
-      - --certificatesresolvers.le.acme.httpchallenge=true
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
 
       # Other settings
       - --api=false
@@ -44,9 +56,9 @@ services:
       - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - acme:/acme
+      - certs:/certs:ro
     networks:
-      - outside_world
+      - internet
       - proxy_attestd
       - proxy_echo
 
@@ -61,13 +73,22 @@ services:
       - traefik.http.routers.attestd.rule=Host(`${SERVER_DOMAIN}`) && PathPrefix(`/attestd/`)
       - traefik.http.routers.attestd.priority=9999
       - traefik.http.routers.attestd.entrypoints=websecure
-      - traefik.http.routers.attestd.tls.certresolver=le
+      - traefik.http.routers.attestd.tls=true
       - traefik.http.services.attestd.loadbalancer.server.port=80
       - traefik.http.middlewares.attestd-strip.stripprefix.prefixes=/attestd
       - traefik.http.routers.attestd.middlewares=attestd-strip
 
+    environment:
+      SERVER_DOMAIN: ${SERVER_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+      ACME_ADMIN_TOKEN: ${ACME_ADMIN_TOKEN:-}
+      CERTIFICATE_PEM_PATH: /certs/tls.crt
+      CERTIFICATE_KEY_PATH: /certs/tls.key
+      ACME_STATE_DIR: /certs/acme
+      TRAEFIK_CERTS_DYNAMIC_PATH: /certs/traefik-certs.yml
+
     volumes:
-      - acme:/acme:ro
+      - certs:/certs
       - /dev/tdx-guest:/dev/tdx-guest
     
     networks:
@@ -82,7 +103,7 @@ services:
       - traefik.docker.network=proxy_echo
       - traefik.http.routers.echo.rule=Host(`${SERVER_DOMAIN}`)
       - traefik.http.routers.echo.entrypoints=websecure
-      - traefik.http.routers.echo.tls.certresolver=le
+      - traefik.http.routers.echo.tls=true
       - traefik.http.services.echo.loadbalancer.server.port=80
     
     networks:
