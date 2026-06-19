@@ -7,6 +7,8 @@ import {
   randomBytes,
   X509Certificate,
 } from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,7 +51,50 @@ function normalizeHex(value, field) {
   return hex.toLowerCase();
 }
 
-async function fetchJson(url, options) {
+function fetchTextWithNodeHttp(url, options = {}, fetchOptions = {}) {
+  const target = url instanceof URL ? url : new URL(url);
+  const client = target.protocol === 'https:' ? https : http;
+  return new Promise((resolve, reject) => {
+    const request = client.request(
+      target,
+      {
+        method: options.method || 'GET',
+        headers: options.headers || {},
+        rejectUnauthorized: fetchOptions.rejectUnauthorized !== false,
+      },
+      (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => {
+          resolve({
+            ok: response.statusCode >= 200 && response.statusCode < 300,
+            status: response.statusCode,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      }
+    );
+    request.on('error', reject);
+    if (options.body) {
+      request.write(options.body);
+    }
+    request.end();
+  });
+}
+
+async function fetchJson(url, options, fetchOptions = {}) {
+  if (fetchOptions.rejectUnauthorized === false) {
+    const response = await fetchTextWithNodeHttp(url, options, fetchOptions);
+    if (!response.ok) {
+      throw new Error(`${url} returned HTTP ${response.status}: ${response.body}`);
+    }
+    try {
+      return JSON.parse(response.body);
+    } catch (err) {
+      throw new Error(`${url} returned non-JSON body: ${err.message}`);
+    }
+  }
+
   const response = await fetch(url, options);
   const body = await response.text();
   if (!response.ok) {
@@ -392,6 +437,8 @@ function claimIncludes(value, expected) {
 }
 
 const SAFE_NODE_GCP_ENV_ALLOWLIST = new Set([
+  'ACME_ADMIN_TOKEN',
+  'ACME_DIRECTORY_URL',
   'ACME_EMAIL',
   'ADMIN_API_KEY',
   'CONFIDENTIAL_SPACE_AUDIENCE',
@@ -399,13 +446,19 @@ const SAFE_NODE_GCP_ENV_ALLOWLIST = new Set([
   'INITIAL_SYNC_BATCH_BLOCKS',
   'INITIAL_SYNC_BATCH_DELAY_MS',
   'INITIAL_SYNC_END_BLOCK',
+  'INITIAL_NODE_SYNC_START_BLOCK',
   'INITIAL_SYNC_START_BLOCK',
   'LIGHTHOUSE_CHECKPOINT_SYNC_URL',
+  'LOCAL_RPC_BATCH_REQUESTS',
   'LOCAL_NODE_SYNC_MODE',
   'NODE_MAP_CAPACITY',
+  'RETH_DATA_SUBDIR',
+  'RETH_RPC_ETH_PROOF_WINDOW',
   'RETH_RPC_URL',
+  'RETH_STORAGE_MODE',
   'ROOT_MAP_CAPACITY',
   'RUN_RETH',
+  'SEED_RPC_BATCH_REQUESTS',
   'SEED_RETH_RPC_URL',
   'SERVER_DOMAIN',
 ]);
@@ -474,7 +527,7 @@ async function verifyGcpAttestdCertificate(opts) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ domain, challenge }),
-  });
+  }, { rejectUnauthorized: false });
 
   if (typeof response.certificate !== 'string') {
     throw new Error('/attestd/ did not return a certificate');
@@ -563,7 +616,7 @@ async function verifyGcpConfidentialSpaceCertificate(opts) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ domain, challenge, audience }),
-  });
+  }, { rejectUnauthorized: false });
 
   if (typeof response.certificate !== 'string') {
     throw new Error('/attestd/ did not return a certificate');

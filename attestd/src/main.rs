@@ -24,6 +24,8 @@ const DEFAULT_ACME_JSON_PATH: &str = "/acme/acme.json";
 const DEFAULT_CERTIFICATE_PEM_PATH: &str = "/certs/tls.crt";
 const DEFAULT_CERTIFICATE_KEY_PATH: &str = "/certs/tls.key";
 const DEFAULT_ACME_STATE_DIR: &str = "/certs/acme";
+const DEFAULT_ACME_ISSUE_STATE_PATH: &str = "/certs/acme/issue-state.json";
+const DEFAULT_ACME_REISSUE_INTERVAL_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DEFAULT_TRAEFIK_CERTS_DYNAMIC_PATH: &str = "/certs/traefik-certs.yml";
 const DEFAULT_WORKLOAD_MANIFEST_PATH: &str = "/measurement/workload-manifest.json";
 const CONFIDENTIAL_SPACE_SOCKET: &str = "/run/container_launcher/teeserver.sock";
@@ -85,6 +87,31 @@ struct AcmeStartResponse {
 #[derive(Deserialize)]
 struct AcmeFinalizeRequest {
   order_id: String,
+  #[serde(default)]
+  force: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AcmeIssueState {
+  domain: String,
+  order_id: String,
+  issued_at_unix: u64,
+  certificate_path: String,
+  key_path: String,
+  certificate_sha256: String,
+  key_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AcmeIssueStateResponse {
+  status: String,
+  domain: String,
+  order_id: String,
+  certificate_path: String,
+  key_path: String,
+  certificate_sha256: String,
+  key_sha256: String,
+  reissue_in_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -194,6 +221,10 @@ fn pending_order_path(order_id: &str) -> Result<PathBuf, String> {
     return Err("invalid order_id".to_string());
   }
   Ok(acme_state_dir().join("orders").join(format!("{order_id}.json")))
+}
+
+fn pending_orders_dir() -> PathBuf {
+  acme_state_dir().join("orders")
 }
 
 fn traefik_certs_dynamic_path() -> String {
@@ -373,12 +404,26 @@ fn ensure_allowed_extra_domain(primary_domain: &str, extra_domain: &str) -> Resu
 }
 
 fn require_acme_auth(req: &HttpRequest) -> ActixResult<()> {
-  let Ok(token) = std::env::var("ACME_ADMIN_TOKEN") else {
-    return Ok(());
-  };
-  if token.is_empty() {
+  let allow_public = std::env::var("ACME_ALLOW_PUBLIC_ACME")
+    .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    .unwrap_or(false);
+  if allow_public {
     return Ok(());
   }
+
+  let token = match std::env::var("ACME_ADMIN_TOKEN") {
+    Ok(token) if !token.trim().is_empty() => token,
+    Ok(_) => {
+      return Err(actix_web::error::ErrorUnauthorized(
+        "ACME admin token is empty; set ACME_ADMIN_TOKEN or ACME_ALLOW_PUBLIC_ACME=true",
+      ));
+    }
+    Err(_) => {
+      return Err(actix_web::error::ErrorUnauthorized(
+        "ACME admin token is not configured; set ACME_ADMIN_TOKEN or ACME_ALLOW_PUBLIC_ACME=true",
+      ));
+    }
+  };
 
   let expected = format!("Bearer {token}");
   let authorized = req
@@ -407,6 +452,43 @@ fn acme_email(requested: Option<&str>) -> Result<String, String> {
     .or_else(|| std::env::var("ACME_EMAIL").ok())
     .filter(|email| !email.trim().is_empty())
     .ok_or_else(|| "ACME email is required".to_string())
+}
+
+fn acme_issue_state_path() -> PathBuf {
+  PathBuf::from(
+    std::env::var("ACME_ISSUE_STATE_PATH")
+      .unwrap_or_else(|_| DEFAULT_ACME_ISSUE_STATE_PATH.to_string()),
+  )
+}
+
+fn acme_reissue_interval_seconds() -> u64 {
+  std::env::var("ACME_REISSUE_INTERVAL_SECONDS")
+    .ok()
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(DEFAULT_ACME_REISSUE_INTERVAL_SECONDS)
+}
+
+fn sha256_hex(path: &str) -> Result<String, String> {
+  let bytes = fs::read(path).map_err(|err| format!("failed to read {path}: {err}"))?;
+  Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+fn load_or_generate_tls_private_key() -> Result<(String, &'static str), String> {
+  let key_path = certificate_key_path();
+  match fs::read_to_string(&key_path) {
+    Ok(private_key_pem) if !private_key_pem.trim().is_empty() => {
+      KeyPair::from_pem(&private_key_pem)
+        .map_err(|err| format!("managed TLS key at {key_path} is not parseable: {err}"))?;
+      Ok((private_key_pem, "existing"))
+    }
+    Ok(_) => Err(format!("managed TLS key at {key_path} is empty")),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+      let key_pair =
+        KeyPair::generate().map_err(|err| format!("failed to generate TLS key: {err}"))?;
+      Ok((key_pair.serialize_pem(), "new"))
+    }
+    Err(err) => Err(format!("failed to read managed TLS key at {key_path}: {err}")),
+  }
 }
 
 fn write_file_atomic(
@@ -441,6 +523,110 @@ fn write_file_atomic(
   Ok(())
 }
 
+fn load_acme_issue_state() -> Result<Option<AcmeIssueState>, String> {
+  let path = acme_issue_state_path();
+  let contents = match fs::read_to_string(&path) {
+    Ok(contents) => contents,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(err) => return Err(format!("failed to read ACME issue state {}: {err}", path.display())),
+  };
+  serde_json::from_str(&contents)
+    .map_err(|err| format!("failed to parse ACME issue state {}: {err}", path.display()))
+}
+
+fn save_acme_issue_state(state: &AcmeIssueState) -> Result<(), String> {
+  let path = acme_issue_state_path();
+  let serialized = serde_json::to_vec_pretty(state)
+    .map_err(|err| format!("failed to serialize ACME issue state: {err}"))?;
+  write_file_atomic(path, &serialized, Some(0o600))
+}
+
+fn build_issue_state_response(state: &AcmeIssueState, now: u64) -> AcmeIssueStateResponse {
+  let reissue_in_seconds =
+    acme_reissue_interval_seconds().saturating_sub(now.saturating_sub(state.issued_at_unix));
+  AcmeIssueStateResponse {
+    status: "issued".to_string(),
+    domain: state.domain.clone(),
+    order_id: state.order_id.clone(),
+    certificate_path: state.certificate_path.clone(),
+    key_path: state.key_path.clone(),
+    certificate_sha256: state.certificate_sha256.clone(),
+    key_sha256: state.key_sha256.clone(),
+    reissue_in_seconds,
+  }
+}
+
+fn can_reuse_issue_state(state: &AcmeIssueState, now: u64, domain: &str) -> bool {
+  if state.domain != domain {
+    return false;
+  }
+  let interval = acme_reissue_interval_seconds();
+  if interval == 0 {
+    return false;
+  }
+  if now.saturating_sub(state.issued_at_unix) > interval {
+    return false;
+  }
+  let cert_sha = match sha256_hex(&state.certificate_path) {
+    Ok(hash) => hash,
+    Err(_) => return false,
+  };
+  let key_sha = match sha256_hex(&state.key_path) {
+    Ok(hash) => hash,
+    Err(_) => return false,
+  };
+  cert_sha == state.certificate_sha256 && key_sha == state.key_sha256
+}
+
+fn can_reuse_issue_state_for_current_domain(state: &AcmeIssueState, now: u64) -> bool {
+  can_reuse_issue_state(state, now, &state.domain)
+}
+
+fn load_pending_order_for_domain(domain: &str) -> Result<Option<PendingAcmeOrder>, String> {
+  let orders_dir = pending_orders_dir();
+  let entries = match fs::read_dir(&orders_dir) {
+    Ok(entries) => entries,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(err) => {
+      return Err(format!(
+        "failed to read ACME pending orders from {}: {err}",
+        orders_dir.display()
+      ))
+    }
+  };
+
+  let mut latest: Option<PendingAcmeOrder> = None;
+  for entry in entries {
+    let entry = entry.map_err(|err| format!("failed to read ACME pending order entry: {err}"))?;
+    let path = entry.path();
+    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+      continue;
+    }
+    let contents = match fs::read_to_string(&path) {
+      Ok(contents) => contents,
+      Err(err) => {
+        eprintln!("Skipping unreadable ACME pending order {}: {err}", path.display());
+        continue;
+      }
+    };
+    let order: PendingAcmeOrder = match serde_json::from_str(&contents) {
+      Ok(order) => order,
+      Err(err) => {
+        eprintln!("Skipping malformed ACME pending order {}: {err}", path.display());
+        continue;
+      }
+    };
+    if order.domain != domain {
+      continue;
+    }
+    if latest.as_ref().is_none_or(|current| order.created_unix > current.created_unix) {
+      latest = Some(order);
+    }
+  }
+
+  Ok(latest)
+}
+
 fn read_managed_certificate() -> Result<Option<String>, String> {
   let path = certificate_pem_path();
   match fs::read_to_string(&path) {
@@ -451,6 +637,39 @@ fn read_managed_certificate() -> Result<Option<String>, String> {
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
     Err(err) => Err(format!("failed to read managed certificate at {path}: {err}")),
   }
+}
+
+fn ensure_bootstrap_certificate() -> Result<(), String> {
+  let cert_path_str = certificate_pem_path();
+  let key_path_str = certificate_key_path();
+  let cert_path = Path::new(&cert_path_str);
+  let key_path = Path::new(&key_path_str);
+
+  let cert_ok = cert_path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false);
+  let key_ok = key_path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false);
+  if cert_ok && key_ok {
+    return Ok(());
+  }
+
+  let server_domain = std::env::var("SERVER_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
+  let key_pair = KeyPair::generate()
+    .map_err(|err| format!("failed to generate bootstrap certificate key pair: {err}"))?;
+  let mut params = CertificateParams::new(vec![server_domain])
+    .map_err(|err| format!("failed to create bootstrap certificate parameters: {err}"))?;
+  params.distinguished_name = DistinguishedName::new();
+  let cert = params
+    .self_signed(&key_pair)
+    .map_err(|err| format!("failed to generate bootstrap certificate: {err}"))?;
+  let cert_pem = cert.pem();
+  let key_pem = key_pair.serialize_pem();
+
+  write_file_atomic(cert_path, cert_pem.as_bytes(), Some(0o644))
+    .map_err(|err| format!("failed to write bootstrap certificate: {err}"))?;
+  write_file_atomic(key_path, key_pem.as_bytes(), Some(0o600))
+    .map_err(|err| format!("failed to write bootstrap key: {err}"))?;
+
+  println!("initialized bootstrap TLS certificate at {}", cert_path.display());
+  Ok(())
 }
 
 fn read_traefik_acme_certificate(domain: &str) -> Result<String, String> {
@@ -551,11 +770,9 @@ fn write_traefik_certificate_config() -> Result<String, String> {
 }
 
 fn initialize_traefik_certificate_config() -> Result<(), String> {
-  let dynamic_path = traefik_certs_dynamic_path();
-  if Path::new(&dynamic_path).exists() {
-    return Ok(());
-  }
-  write_file_atomic(dynamic_path, b"tls:\n  certificates: []\n", None)
+  ensure_bootstrap_certificate()?;
+  write_traefik_certificate_config()?;
+  Ok(())
 }
 
 fn acme_retry_policy() -> RetryPolicy {
@@ -573,6 +790,47 @@ async fn acme_start(
   require_acme_auth(&http_req)?;
 
   let domain = normalize_domain(&req.domain).map_err(actix_web::error::ErrorBadRequest)?;
+  let now = now_unix();
+
+  if let Ok(Some(state)) = load_acme_issue_state() {
+    if can_reuse_issue_state_for_current_domain(&state, now) && state.domain == domain {
+      println!("Returning cached ACME issue state for order {}", state.order_id);
+      return Ok(HttpResponse::Ok().json(build_issue_state_response(&state, now)));
+    }
+  }
+
+  if let Ok(Some(pending)) = load_pending_order_for_domain(&domain) {
+    println!("Returning existing pending ACME order {}", pending.order_id);
+    let first_record = pending
+      .dns_records
+      .first()
+      .cloned()
+      .or_else(|| {
+        if pending.dns_name.is_empty() || pending.dns_value.is_empty() {
+          None
+        } else {
+          Some(AcmeDnsRecord {
+            dns_type: "TXT".to_string(),
+            dns_name: pending.dns_name.clone(),
+            dns_value: pending.dns_value.clone(),
+          })
+        }
+      })
+      .ok_or_else(|| {
+        actix_web::error::ErrorInternalServerError("pending ACME order is missing DNS record data")
+      })?;
+    return Ok(HttpResponse::Ok().json(AcmeStartResponse {
+      status: "pending".to_string(),
+      order_id: pending.order_id,
+      domain: pending.domain,
+      dns_type: first_record.dns_type,
+      dns_name: first_record.dns_name,
+      dns_value: first_record.dns_value,
+      dns_records: pending.dns_records,
+      directory_url: pending.directory_url,
+    }));
+  }
+
   ensure_allowed_acme_domain(&domain).map_err(actix_web::error::ErrorBadRequest)?;
   let mut domains = vec![domain.clone()];
   if let Some(extra_domains) = &req.extra_domains {
@@ -594,11 +852,11 @@ async fn acme_start(
     actix_web::error::ErrorInternalServerError("Failed to prepare ACME account")
   })?;
 
-  let key_pair = KeyPair::generate().map_err(|err| {
-    eprintln!("Failed to generate TLS key: {err}");
-    actix_web::error::ErrorInternalServerError("Failed to generate TLS key")
+  let (private_key_pem, key_source) = load_or_generate_tls_private_key().map_err(|err| {
+    eprintln!("Failed to prepare TLS key: {err}");
+    actix_web::error::ErrorInternalServerError("Failed to prepare TLS key")
   })?;
-  let private_key_pem = key_pair.serialize_pem();
+  println!("Creating ACME order for {domain} using {key_source} managed TLS key");
 
   let identifiers = domains.iter().cloned().map(Identifier::Dns).collect::<Vec<_>>();
   let mut order = account.new_order(&NewOrder::new(&identifiers)).await.map_err(|err| {
@@ -676,9 +934,43 @@ async fn acme_finalize(
   req: web::Json<AcmeFinalizeRequest>,
 ) -> ActixResult<HttpResponse> {
   require_acme_auth(&http_req)?;
+  let now = now_unix();
 
-  let pending = load_pending_order(&req.order_id).map_err(actix_web::error::ErrorBadRequest)?;
+  if !req.force {
+    if let Ok(Some(state)) = load_acme_issue_state() {
+      if state.order_id == req.order_id && can_reuse_issue_state_for_current_domain(&state, now) {
+        println!("Reusing ACME state for order {}", state.order_id);
+        return Ok(HttpResponse::Ok().json(build_issue_state_response(&state, now)));
+      }
+    }
+  }
+
+  let pending = match load_pending_order(&req.order_id) {
+    Ok(order) => order,
+    Err(err) => {
+      eprintln!("Cannot load pending ACME order {0}: {1}", req.order_id, err);
+      if !req.force {
+        if let Ok(Some(state)) = load_acme_issue_state() {
+          if state.order_id == req.order_id && can_reuse_issue_state_for_current_domain(&state, now)
+          {
+            println!("Reusing ACME state for order {}", state.order_id);
+            return Ok(HttpResponse::Ok().json(build_issue_state_response(&state, now)));
+          }
+        }
+      }
+      return Err(actix_web::error::ErrorBadRequest("order not found"));
+    }
+  };
+
   ensure_allowed_acme_domain(&pending.domain).map_err(actix_web::error::ErrorBadRequest)?;
+
+  if !req.force {
+    if let Ok(Some(state)) = load_acme_issue_state() {
+      if state.order_id == req.order_id && can_reuse_issue_state(&state, now, &pending.domain) {
+        return Ok(HttpResponse::Ok().json(build_issue_state_response(&state, now)));
+      }
+    }
+  }
 
   let account = load_acme_account(&pending.directory_url).await.map_err(|err| {
     eprintln!("Failed to restore ACME account: {err}");
@@ -769,6 +1061,33 @@ async fn acme_finalize(
     eprintln!("Failed to write Traefik certificate config: {err}");
     actix_web::error::ErrorInternalServerError("Failed to write Traefik certificate config")
   })?;
+
+  let certificate_sha256 = match sha256_hex(&cert_path) {
+    Ok(hash) => hash,
+    Err(err) => {
+      eprintln!("Failed to compute certificate SHA-256: {err}");
+      String::new()
+    }
+  };
+  let key_sha256 = match sha256_hex(&key_path) {
+    Ok(hash) => hash,
+    Err(err) => {
+      eprintln!("Failed to compute TLS key SHA-256: {err}");
+      String::new()
+    }
+  };
+  let state = AcmeIssueState {
+    domain: pending.domain.clone(),
+    order_id: pending.order_id.clone(),
+    issued_at_unix: now,
+    certificate_path: cert_path.clone(),
+    key_path: key_path.clone(),
+    certificate_sha256,
+    key_sha256,
+  };
+  if let Err(err) = save_acme_issue_state(&state) {
+    eprintln!("Failed to persist ACME issue state: {err}");
+  }
   remove_pending_order(&pending.order_id);
 
   Ok(HttpResponse::Ok().json(AcmeFinalizeResponse {
